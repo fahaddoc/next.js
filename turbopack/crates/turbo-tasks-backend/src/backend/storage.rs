@@ -51,6 +51,15 @@ pub enum SpecificTaskDataCategory {
     Data,
 }
 
+impl From<SpecificTaskDataCategory> for TaskDataCategory {
+    fn from(category: SpecificTaskDataCategory) -> Self {
+        match category {
+            SpecificTaskDataCategory::Meta => TaskDataCategory::Meta,
+            SpecificTaskDataCategory::Data => TaskDataCategory::Data,
+        }
+    }
+}
+
 impl SpecificTaskDataCategory {
     /// Returns the KeySpace for storing data of this category
     pub fn key_space(self) -> KeySpace {
@@ -84,7 +93,7 @@ pub struct Storage {
     ///
     /// Threads waiting for another thread's in-progress restore subscribe to this event,
     /// then re-check the specific task's `restoring`/`restored` bits after waking.
-    pub restored: Event,
+    pub(crate) restored: Event,
 }
 
 impl Storage {
