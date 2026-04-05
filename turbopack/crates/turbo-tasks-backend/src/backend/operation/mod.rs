@@ -12,10 +12,11 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::{Context, bail};
 use bincode::{Decode, Encode};
 use turbo_tasks::{
     CellId, FxIndexMap, TaskExecutionReason, TaskId, TaskPriority, TurboTasksBackendApi,
-    TurboTasksCallApi, TypedSharedReference, backend::CachedTaskType,
+    TurboTasksCallApi, TypedSharedReference, backend::CachedTaskType, event::EventListener,
 };
 
 use self::aggregation_update::ComputeDirtyAndCleanUpdate;
@@ -173,56 +174,75 @@ impl<'e, B: BackingStorage> ExecuteContextImpl<'e, B> {
         &self,
         task_id: TaskId,
         category: SpecificTaskDataCategory,
-    ) -> TaskStorage {
+    ) -> anyhow::Result<TaskStorage> {
         if !self.should_check_backing_storage() {
             // If we don't need to restore, we can just return an empty storage
-            return TaskStorage::default();
+            return Ok(TaskStorage::default());
         }
         let mut storage = TaskStorage::default();
-        let result = self
-            .backend
+        self.backend
             .backing_storage
-            .lookup_data(task_id, category, &mut storage);
-
-        match result {
-            Ok(()) => storage,
-            Err(e) => {
-                panic!(
-                    "Failed to restore task data (corrupted database or bug): {:?}",
-                    e.context(format!("{category:?} for {task_id})"))
-                )
-            }
-        }
+            .lookup_data(task_id, category, &mut storage)
+            .with_context(|| format!("Failed to restore {category:?} for {task_id}"))?;
+        Ok(storage)
     }
 
     fn restore_task_data_batch(
         &self,
         task_ids: &[TaskId],
         category: SpecificTaskDataCategory,
-    ) -> Option<Vec<TaskStorage>> {
-        debug_assert!(
-            task_ids.len() > 1,
-            "Use restore_task_data_typed for single task"
-        );
+    ) -> anyhow::Result<Option<Vec<TaskStorage>>> {
+        debug_assert!(task_ids.len() > 1, "Use restore_task_data for single task");
         if !self.should_check_backing_storage() {
             // If we don't need to restore, we return None
-            return None;
+            return Ok(None);
         }
         let result = self
             .backend
             .backing_storage
-            .batch_lookup_data(task_ids, category);
-        match result {
-            Ok(result) => Some(result),
-            Err(e) => {
-                panic!(
-                    "Failed to restore task data (corrupted database or bug): {:?}",
-                    e.context(format!(
-                        "{category:?} for batch of {} tasks",
-                        task_ids.len()
-                    ))
+            .batch_lookup_data(task_ids, category)
+            .with_context(|| {
+                format!(
+                    "Failed to restore {category:?} for batch of {} tasks",
+                    task_ids.len()
                 )
+            })?;
+        Ok(Some(result))
+    }
+
+    /// Waits for another thread's in-progress restore of a task to complete.
+    ///
+    /// Precondition: the caller must have observed `is_restoring()` == true for
+    /// `task_id`+`category` and must have dropped the task lock before calling this.
+    ///
+    /// Returns `Ok(())` when the task is restored (the restoring bits are cleared and the
+    /// restored bits are set), or `Err` if the restoring thread failed (restoring was cleared
+    /// without setting restored).
+    fn wait_for_restoring_task(
+        &self,
+        task_id: TaskId,
+        category: TaskDataCategory,
+    ) -> anyhow::Result<()> {
+        loop {
+            // Register a listener BEFORE checking the bits (avoids a lost-wakeup race).
+            let listener: EventListener = self.backend.storage.restored.listen();
+
+            let task = self.backend.storage.access_mut(task_id);
+            let is_restoring = task.flags.is_restoring(category);
+            let is_restored = task.flags.is_restored(category);
+            drop(task);
+
+            if is_restored {
+                // The restoring thread finished successfully; we're done waiting.
+                return Ok(());
             }
+            if !is_restoring {
+                // The restoring bit was cleared without setting the restored bit.
+                // This means the restoring thread encountered an error.
+                bail!("Restore of {category:?} for task {task_id} failed in another thread");
+            }
+            // Still restoring; block until notified, then loop to re-check.
+            listener.wait();
         }
     }
 
@@ -240,14 +260,13 @@ impl<'e, B: BackingStorage> ExecuteContextImpl<'e, B> {
         let mut data_count = 0;
         let mut meta_count = 0;
         let mut all_count = 0;
+        // (task_id, category, data_restore_result, meta_restore_result, wait_data, wait_meta)
         let mut tasks = task_ids
             .into_iter()
             .filter(|&(id, category)| {
                 if id.is_transient() {
                     if call_prepared_task_callback_for_transient_tasks {
                         let mut task = self.backend.storage.access_mut(id);
-                        // TODO add is_restoring and avoid concurrent restores and duplicates tasks
-                        // ids in `task_ids`
                         if !task.flags.is_restored(category) {
                             task.flags.set_restored(TaskDataCategory::All);
                         }
@@ -263,120 +282,230 @@ impl<'e, B: BackingStorage> ExecuteContextImpl<'e, B> {
                 TaskDataCategory::Meta => meta_count += 1,
                 TaskDataCategory::All => all_count += 1,
             })
-            .map(|(id, category)| (id, category, None, None))
+            .map(|(id, category)| {
+                (
+                    id,
+                    category,
+                    None::<anyhow::Result<TaskStorage>>,
+                    None::<anyhow::Result<TaskStorage>>,
+                    false, // wait_data
+                    false, // wait_meta
+                )
+            })
             .collect::<Vec<_>>();
         data_count += all_count;
         meta_count += all_count;
 
         let mut tasks_to_restore_for_data = Vec::with_capacity(data_count);
-        let mut tasks_to_restore_for_data_indicies = Vec::with_capacity(data_count);
+        let mut tasks_to_restore_for_data_indices = Vec::with_capacity(data_count);
         let mut tasks_to_restore_for_meta = Vec::with_capacity(meta_count);
-        let mut tasks_to_restore_for_meta_indicies = Vec::with_capacity(meta_count);
-        for (i, &(task_id, category, _, _)) in tasks.iter().enumerate() {
-            self.task_lock_counter.acquire();
+        let mut tasks_to_restore_for_meta_indices = Vec::with_capacity(meta_count);
 
-            let task = self.backend.storage.access_mut(task_id);
+        // --- Phase 1a: Classify tasks under lock ---
+        // For each task, determine whether we will restore it ourselves or wait for another thread.
+        for (i, (task_id, category, _, _, wait_data, wait_meta)) in tasks.iter_mut().enumerate() {
+            let task_id = *task_id;
+            let category = *category;
+            self.task_lock_counter.acquire();
+            let mut task = self.backend.storage.access_mut(task_id);
             let mut ready = true;
-            if matches!(category, TaskDataCategory::Data | TaskDataCategory::All)
-                && !task.flags.is_restored(TaskDataCategory::Data)
-            {
-                tasks_to_restore_for_data.push(task_id);
-                tasks_to_restore_for_data_indicies.push(i);
-                ready = false;
+
+            if category.includes_data() && !task.flags.is_restored(TaskDataCategory::Data) {
+                if task.flags.data_restoring() {
+                    // Another thread is restoring data; we'll wait in Phase 2
+                    *wait_data = true;
+                    ready = false;
+                } else {
+                    // We claim responsibility for restoring data
+                    task.flags.set_data_restoring(true);
+                    tasks_to_restore_for_data.push(task_id);
+                    tasks_to_restore_for_data_indices.push(i);
+                    ready = false;
+                }
             }
-            if matches!(category, TaskDataCategory::Meta | TaskDataCategory::All)
-                && !task.flags.is_restored(TaskDataCategory::Meta)
-            {
-                tasks_to_restore_for_meta.push(task_id);
-                tasks_to_restore_for_meta_indicies.push(i);
-                ready = false;
+
+            if category.includes_meta() && !task.flags.is_restored(TaskDataCategory::Meta) {
+                if task.flags.meta_restoring() {
+                    // Another thread is restoring meta; we'll wait in Phase 2
+                    *wait_meta = true;
+                    ready = false;
+                } else {
+                    // We claim responsibility for restoring meta
+                    task.flags.set_meta_restoring(true);
+                    tasks_to_restore_for_meta.push(task_id);
+                    tasks_to_restore_for_meta_indices.push(i);
+                    ready = false;
+                }
             }
+
             self.task_lock_counter.release();
             if ready {
                 prepared_task_callback(self, task_id, category, task);
             }
+            // else: task guard is dropped here
         }
-        if tasks_to_restore_for_meta.is_empty() && tasks_to_restore_for_data.is_empty() {
+
+        if tasks_to_restore_for_meta.is_empty()
+            && tasks_to_restore_for_data.is_empty()
+            && tasks.iter().all(|(_, _, _, _, wd, wm)| !wd && !wm)
+        {
             return;
         }
 
+        // --- Phase 1b: Batch I/O for tasks we claimed ---
+
+        // Data I/O
         match tasks_to_restore_for_data.len() {
             0 => {}
             1 => {
                 let task_id = tasks_to_restore_for_data[0];
-                let data = self.restore_task_data(task_id, SpecificTaskDataCategory::Data);
-                let idx = tasks_to_restore_for_data_indicies[0];
-                tasks[idx].2 = Some(data);
+                let idx = tasks_to_restore_for_data_indices[0];
+                tasks[idx].2 =
+                    Some(self.restore_task_data(task_id, SpecificTaskDataCategory::Data));
             }
             _ => {
-                if let Some(data) = self.restore_task_data_batch(
+                match self.restore_task_data_batch(
                     &tasks_to_restore_for_data,
                     SpecificTaskDataCategory::Data,
                 ) {
-                    data.into_iter()
-                        .zip(tasks_to_restore_for_data_indicies)
-                        .for_each(|(item, idx)| {
-                            tasks[idx].2 = Some(item);
-                        });
-                } else {
-                    for idx in tasks_to_restore_for_data_indicies {
-                        tasks[idx].2 = Some(TaskStorage::default());
+                    Ok(Some(data)) => {
+                        for (item, &idx) in data.into_iter().zip(&tasks_to_restore_for_data_indices)
+                        {
+                            tasks[idx].2 = Some(Ok(item));
+                        }
+                    }
+                    Ok(None) => {
+                        // should_check_backing_storage() was false; treat as empty
+                        for &idx in &tasks_to_restore_for_data_indices {
+                            tasks[idx].2 = Some(Ok(TaskStorage::default()));
+                        }
+                    }
+                    Err(e) => {
+                        // Batch failure: distribute the error to each affected task
+                        let e = Arc::new(e);
+                        for &idx in &tasks_to_restore_for_data_indices {
+                            tasks[idx].2 =
+                                Some(Err(anyhow::anyhow!("Batch data restore failed: {e}")));
+                        }
                     }
                 }
             }
         }
+
+        // Meta I/O
         match tasks_to_restore_for_meta.len() {
             0 => {}
             1 => {
                 let task_id = tasks_to_restore_for_meta[0];
-                let data = self.restore_task_data(task_id, SpecificTaskDataCategory::Meta);
-                let idx = tasks_to_restore_for_meta_indicies[0];
-                tasks[idx].3 = Some(data);
+                let idx = tasks_to_restore_for_meta_indices[0];
+                tasks[idx].3 =
+                    Some(self.restore_task_data(task_id, SpecificTaskDataCategory::Meta));
             }
             _ => {
-                if let Some(data) = self.restore_task_data_batch(
+                match self.restore_task_data_batch(
                     &tasks_to_restore_for_meta,
                     SpecificTaskDataCategory::Meta,
                 ) {
-                    data.into_iter()
-                        .zip(tasks_to_restore_for_meta_indicies)
-                        .for_each(|(item, idx)| {
-                            tasks[idx].3 = Some(item);
-                        });
-                } else {
-                    for idx in tasks_to_restore_for_meta_indicies {
-                        tasks[idx].3 = Some(TaskStorage::new());
+                    Ok(Some(data)) => {
+                        for (item, &idx) in data.into_iter().zip(&tasks_to_restore_for_meta_indices)
+                        {
+                            tasks[idx].3 = Some(Ok(item));
+                        }
+                    }
+                    Ok(None) => {
+                        for &idx in &tasks_to_restore_for_meta_indices {
+                            tasks[idx].3 = Some(Ok(TaskStorage::default()));
+                        }
+                    }
+                    Err(e) => {
+                        let e = Arc::new(e);
+                        for &idx in &tasks_to_restore_for_meta_indices {
+                            tasks[idx].3 =
+                                Some(Err(anyhow::anyhow!("Batch meta restore failed: {e}")));
+                        }
                     }
                 }
             }
         }
 
-        for (task_id, category, storage_for_data, storage_for_meta) in tasks {
-            if storage_for_data.is_none() && storage_for_meta.is_none() {
+        // --- Phase 1c: Apply I/O results for tasks we restored ---
+        for (task_id, category, storage_for_data, storage_for_meta, _, _) in &mut tasks {
+            let has_data_result = storage_for_data.is_some();
+            let has_meta_result = storage_for_meta.is_some();
+            if !has_data_result && !has_meta_result {
                 continue;
             }
-            self.task_lock_counter.acquire();
 
+            self.task_lock_counter.acquire();
             let mut task_type = None;
-            let mut task = self.backend.storage.access_mut(task_id);
-            if let Some(storage) = storage_for_data
-                && !task.flags.is_restored(TaskDataCategory::Data)
-            {
-                task.restore_from(storage, TaskDataCategory::Data);
-                task.flags.set_restored(TaskDataCategory::Data);
-                task_type = task.get_persistent_task_type().cloned()
+            let mut task = self.backend.storage.access_mut(*task_id);
+
+            if let Some(data_result) = storage_for_data.take() {
+                match data_result {
+                    Ok(storage) => {
+                        if !task.flags.is_restored(TaskDataCategory::Data) {
+                            task.restore_from(storage, TaskDataCategory::Data);
+                            task.flags.set_restored(TaskDataCategory::Data);
+                            task_type = task.get_persistent_task_type().cloned();
+                        }
+                        task.flags.set_data_restoring(false);
+                    }
+                    Err(e) => {
+                        task.flags.set_data_restoring(false);
+                        drop(task);
+                        self.backend.storage.restored.notify(usize::MAX);
+                        panic!("Failed to restore data for task {task_id}: {e:?}");
+                    }
+                }
             }
-            if let Some(storage) = storage_for_meta
-                && !task.flags.is_restored(TaskDataCategory::Meta)
-            {
-                task.restore_from(storage, TaskDataCategory::Meta);
-                task.flags.set_restored(TaskDataCategory::Meta);
+
+            if let Some(meta_result) = storage_for_meta.take() {
+                match meta_result {
+                    Ok(storage) => {
+                        if !task.flags.is_restored(TaskDataCategory::Meta) {
+                            task.restore_from(storage, TaskDataCategory::Meta);
+                            task.flags.set_restored(TaskDataCategory::Meta);
+                        }
+                        task.flags.set_meta_restoring(false);
+                    }
+                    Err(e) => {
+                        task.flags.set_meta_restoring(false);
+                        drop(task);
+                        self.backend.storage.restored.notify(usize::MAX);
+                        panic!("Failed to restore meta for task {task_id}: {e:?}");
+                    }
+                }
             }
+
             self.task_lock_counter.release();
-            prepared_task_callback(self, task_id, category, task);
+            // Notify all waiters that restoration state changed for this task
+            self.backend.storage.restored.notify(usize::MAX);
+            prepared_task_callback(self, *task_id, *category, task);
+
             if let Some(task_type) = task_type {
                 // Insert into the task cache to avoid future lookups
-                self.backend.task_cache.entry(task_type).or_insert(task_id);
+                self.backend.task_cache.entry(task_type).or_insert(*task_id);
+            }
+        }
+
+        // --- Phase 2: Wait for tasks being restored by other threads ---
+        for (task_id, category, _, _, wait_data, wait_meta) in &tasks {
+            if *wait_data {
+                if let Err(e) = self.wait_for_restoring_task(*task_id, TaskDataCategory::Data) {
+                    panic!("Restore of data for task {task_id} failed in another thread: {e:?}");
+                }
+            }
+            if *wait_meta {
+                if let Err(e) = self.wait_for_restoring_task(*task_id, TaskDataCategory::Meta) {
+                    panic!("Restore of meta for task {task_id} failed in another thread: {e:?}");
+                }
+            }
+            if *wait_data || *wait_meta {
+                // Now that the task is restored, call the callback
+                self.task_lock_counter.acquire();
+                let task = self.backend.storage.access_mut(*task_id);
+                self.task_lock_counter.release();
+                prepared_task_callback(self, *task_id, *category, task);
             }
         }
     }
@@ -409,31 +538,89 @@ impl<'e, B: BackingStorage> ExecuteContext<'e> for ExecuteContextImpl<'e, B> {
                 let needs_meta =
                     category.includes_meta() && !task.flags.is_restored(TaskDataCategory::Meta);
 
-                if needs_data || needs_meta {
-                    // Avoid holding the lock too long since this can also affect other tasks
-                    // Drop lock once, do all I/O, then re-acquire once
+                // Check whether another thread is currently restoring each category.
+                let data_restoring = needs_data && task.flags.data_restoring();
+                let meta_restoring = needs_meta && task.flags.meta_restoring();
+
+                // Claim categories no one else is restoring.
+                let do_data = needs_data && !data_restoring;
+                let do_meta = needs_meta && !meta_restoring;
+                if do_data {
+                    task.flags.set_data_restoring(true);
+                }
+                if do_meta {
+                    task.flags.set_meta_restoring(true);
+                }
+
+                if do_data || do_meta || data_restoring || meta_restoring {
+                    // Drop lock while doing I/O or waiting.
                     drop(task);
 
-                    let storage_data = needs_data
+                    // Wait for categories claimed by another thread.
+                    if data_restoring {
+                        self.wait_for_restoring_task(task_id, TaskDataCategory::Data)
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "Restore of data for task {task_id} failed in another thread: \
+                                     {e:?}"
+                                )
+                            });
+                    }
+                    if meta_restoring {
+                        self.wait_for_restoring_task(task_id, TaskDataCategory::Meta)
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "Restore of meta for task {task_id} failed in another thread: \
+                                     {e:?}"
+                                )
+                            });
+                    }
+
+                    // Perform I/O for categories we claimed.
+                    let storage_data = do_data
                         .then(|| self.restore_task_data(task_id, SpecificTaskDataCategory::Data));
-                    let storage_meta = needs_meta
+                    let storage_meta = do_meta
                         .then(|| self.restore_task_data(task_id, SpecificTaskDataCategory::Meta));
 
                     task = self.backend.storage.access_mut(task_id);
 
-                    // Handle race conditions and merge
-                    if let Some(storage) = storage_data
-                        && !task.flags.is_restored(TaskDataCategory::Data)
-                    {
-                        task.restore_from(storage, TaskDataCategory::Data);
-                        task.flags.set_restored(TaskDataCategory::Data);
+                    // Apply results and clear restoring bits.
+                    if let Some(data_result) = storage_data {
+                        match data_result {
+                            Ok(storage) => {
+                                if !task.flags.is_restored(TaskDataCategory::Data) {
+                                    task.restore_from(storage, TaskDataCategory::Data);
+                                    task.flags.set_restored(TaskDataCategory::Data);
+                                }
+                                task.flags.set_data_restoring(false);
+                            }
+                            Err(e) => {
+                                task.flags.set_data_restoring(false);
+                                drop(task);
+                                self.backend.storage.restored.notify(usize::MAX);
+                                panic!("Failed to restore data for task {task_id}: {e:?}");
+                            }
+                        }
                     }
-                    if let Some(storage) = storage_meta
-                        && !task.flags.is_restored(TaskDataCategory::Meta)
-                    {
-                        task.restore_from(storage, TaskDataCategory::Meta);
-                        task.flags.set_restored(TaskDataCategory::Meta);
+                    if let Some(meta_result) = storage_meta {
+                        match meta_result {
+                            Ok(storage) => {
+                                if !task.flags.is_restored(TaskDataCategory::Meta) {
+                                    task.restore_from(storage, TaskDataCategory::Meta);
+                                    task.flags.set_restored(TaskDataCategory::Meta);
+                                }
+                                task.flags.set_meta_restoring(false);
+                            }
+                            Err(e) => {
+                                task.flags.set_meta_restoring(false);
+                                drop(task);
+                                self.backend.storage.restored.notify(usize::MAX);
+                                panic!("Failed to restore meta for task {task_id}: {e:?}");
+                            }
+                        }
                     }
+                    // Notify all waiters that restoration state changed.
+                    self.backend.storage.restored.notify(usize::MAX);
                 }
             }
         }
@@ -482,7 +669,7 @@ impl<'e, B: BackingStorage> ExecuteContext<'e> for ExecuteContextImpl<'e, B> {
 
         let (mut task1, mut task2) = self.backend.storage.access_pair_mut(task_id1, task_id2);
 
-        // Collect what needs restoring for each task
+        // Collect what needs restoring for each task.
         let needs_data1 =
             category.includes_data() && !task1.flags.is_restored(TaskDataCategory::Data);
         let needs_meta1 =
@@ -492,51 +679,168 @@ impl<'e, B: BackingStorage> ExecuteContext<'e> for ExecuteContextImpl<'e, B> {
         let needs_meta2 =
             category.includes_meta() && !task2.flags.is_restored(TaskDataCategory::Meta);
 
-        if needs_data1 || needs_meta1 || needs_data2 || needs_meta2 {
-            // Avoid holding the lock too long since this can also affect other tasks
-            // Drop locks once, do all I/O, then re-acquire once
+        // Check whether another thread is restoring each category.
+        let data1_restoring = needs_data1 && task1.flags.data_restoring();
+        let meta1_restoring = needs_meta1 && task1.flags.meta_restoring();
+        let data2_restoring = needs_data2 && task2.flags.data_restoring();
+        let meta2_restoring = needs_meta2 && task2.flags.meta_restoring();
+
+        // Claim categories no one else is restoring.
+        let do_data1 = needs_data1 && !data1_restoring;
+        let do_meta1 = needs_meta1 && !meta1_restoring;
+        let do_data2 = needs_data2 && !data2_restoring;
+        let do_meta2 = needs_meta2 && !meta2_restoring;
+        if do_data1 {
+            task1.flags.set_data_restoring(true);
+        }
+        if do_meta1 {
+            task1.flags.set_meta_restoring(true);
+        }
+        if do_data2 {
+            task2.flags.set_data_restoring(true);
+        }
+        if do_meta2 {
+            task2.flags.set_meta_restoring(true);
+        }
+
+        if do_data1
+            || do_meta1
+            || do_data2
+            || do_meta2
+            || data1_restoring
+            || meta1_restoring
+            || data2_restoring
+            || meta2_restoring
+        {
+            // Drop both locks while doing I/O or waiting.
             drop(task1);
             drop(task2);
 
-            let storage_data1 = needs_data1
-                .then(|| self.restore_task_data(task_id1, SpecificTaskDataCategory::Data));
-            let storage_meta1 = needs_meta1
-                .then(|| self.restore_task_data(task_id1, SpecificTaskDataCategory::Meta));
-            let storage_data2 = needs_data2
-                .then(|| self.restore_task_data(task_id2, SpecificTaskDataCategory::Data));
-            let storage_meta2 = needs_meta2
-                .then(|| self.restore_task_data(task_id2, SpecificTaskDataCategory::Meta));
+            // Wait for categories claimed by another thread.
+            if data1_restoring {
+                self.wait_for_restoring_task(task_id1, TaskDataCategory::Data)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "Restore of data for task {task_id1} failed in another thread: {e:?}"
+                        )
+                    });
+            }
+            if meta1_restoring {
+                self.wait_for_restoring_task(task_id1, TaskDataCategory::Meta)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "Restore of meta for task {task_id1} failed in another thread: {e:?}"
+                        )
+                    });
+            }
+            if data2_restoring {
+                self.wait_for_restoring_task(task_id2, TaskDataCategory::Data)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "Restore of data for task {task_id2} failed in another thread: {e:?}"
+                        )
+                    });
+            }
+            if meta2_restoring {
+                self.wait_for_restoring_task(task_id2, TaskDataCategory::Meta)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "Restore of meta for task {task_id2} failed in another thread: {e:?}"
+                        )
+                    });
+            }
+
+            // Perform I/O for categories we claimed.
+            let storage_data1 =
+                do_data1.then(|| self.restore_task_data(task_id1, SpecificTaskDataCategory::Data));
+            let storage_meta1 =
+                do_meta1.then(|| self.restore_task_data(task_id1, SpecificTaskDataCategory::Meta));
+            let storage_data2 =
+                do_data2.then(|| self.restore_task_data(task_id2, SpecificTaskDataCategory::Data));
+            let storage_meta2 =
+                do_meta2.then(|| self.restore_task_data(task_id2, SpecificTaskDataCategory::Meta));
 
             let (t1, t2) = self.backend.storage.access_pair_mut(task_id1, task_id2);
             task1 = t1;
             task2 = t2;
 
-            // Merge results, handling race conditions
-            if let Some(storage) = storage_data1
-                && !task1.flags.is_restored(TaskDataCategory::Data)
-            {
-                task1.restore_from(storage, TaskDataCategory::Data);
-                task1.flags.set_restored(TaskDataCategory::Data);
+            // Apply results and clear restoring bits.
+            if let Some(data1_result) = storage_data1 {
+                match data1_result {
+                    Ok(storage) => {
+                        if !task1.flags.is_restored(TaskDataCategory::Data) {
+                            task1.restore_from(storage, TaskDataCategory::Data);
+                            task1.flags.set_restored(TaskDataCategory::Data);
+                        }
+                        task1.flags.set_data_restoring(false);
+                    }
+                    Err(e) => {
+                        task1.flags.set_data_restoring(false);
+                        drop(task1);
+                        drop(task2);
+                        self.backend.storage.restored.notify(usize::MAX);
+                        panic!("Failed to restore data for task {task_id1}: {e:?}");
+                    }
+                }
             }
-            if let Some(storage) = storage_meta1
-                && !task1.flags.is_restored(TaskDataCategory::Meta)
-            {
-                task1.restore_from(storage, TaskDataCategory::Meta);
-                task1.flags.set_restored(TaskDataCategory::Meta);
+            if let Some(meta1_result) = storage_meta1 {
+                match meta1_result {
+                    Ok(storage) => {
+                        if !task1.flags.is_restored(TaskDataCategory::Meta) {
+                            task1.restore_from(storage, TaskDataCategory::Meta);
+                            task1.flags.set_restored(TaskDataCategory::Meta);
+                        }
+                        task1.flags.set_meta_restoring(false);
+                    }
+                    Err(e) => {
+                        task1.flags.set_meta_restoring(false);
+                        drop(task1);
+                        drop(task2);
+                        self.backend.storage.restored.notify(usize::MAX);
+                        panic!("Failed to restore meta for task {task_id1}: {e:?}");
+                    }
+                }
             }
-            if let Some(storage) = storage_data2
-                && !task2.flags.is_restored(TaskDataCategory::Data)
-            {
-                task2.restore_from(storage, TaskDataCategory::Data);
-                task2.flags.set_restored(TaskDataCategory::Data);
+            if let Some(data2_result) = storage_data2 {
+                match data2_result {
+                    Ok(storage) => {
+                        if !task2.flags.is_restored(TaskDataCategory::Data) {
+                            task2.restore_from(storage, TaskDataCategory::Data);
+                            task2.flags.set_restored(TaskDataCategory::Data);
+                        }
+                        task2.flags.set_data_restoring(false);
+                    }
+                    Err(e) => {
+                        task2.flags.set_data_restoring(false);
+                        drop(task1);
+                        drop(task2);
+                        self.backend.storage.restored.notify(usize::MAX);
+                        panic!("Failed to restore data for task {task_id2}: {e:?}");
+                    }
+                }
             }
-            if let Some(storage) = storage_meta2
-                && !task2.flags.is_restored(TaskDataCategory::Meta)
-            {
-                task2.restore_from(storage, TaskDataCategory::Meta);
-                task2.flags.set_restored(TaskDataCategory::Meta);
+            if let Some(meta2_result) = storage_meta2 {
+                match meta2_result {
+                    Ok(storage) => {
+                        if !task2.flags.is_restored(TaskDataCategory::Meta) {
+                            task2.restore_from(storage, TaskDataCategory::Meta);
+                            task2.flags.set_restored(TaskDataCategory::Meta);
+                        }
+                        task2.flags.set_meta_restoring(false);
+                    }
+                    Err(e) => {
+                        task2.flags.set_meta_restoring(false);
+                        drop(task1);
+                        drop(task2);
+                        self.backend.storage.restored.notify(usize::MAX);
+                        panic!("Failed to restore meta for task {task_id2}: {e:?}");
+                    }
+                }
             }
+            // Notify all waiters that restoration state changed.
+            self.backend.storage.restored.notify(usize::MAX);
         }
+
         (
             TaskGuardImpl {
                 task: task1,

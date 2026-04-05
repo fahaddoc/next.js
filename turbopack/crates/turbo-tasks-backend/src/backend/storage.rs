@@ -8,7 +8,7 @@ use std::{
 use smallvec::SmallVec;
 use thread_local::ThreadLocal;
 use turbo_bincode::TurboBincodeBuffer;
-use turbo_tasks::{FxDashMap, TaskId, parallel};
+use turbo_tasks::{FxDashMap, TaskId, event::Event, parallel};
 
 use crate::{
     backend::storage_schema::TaskStorage,
@@ -80,6 +80,11 @@ pub struct Storage {
     snapshot_mode: AtomicBool,
     modified: FxDashMap<TaskId, ModifiedState>,
     map: FxDashMap<TaskId, Box<TaskStorage>>,
+    /// A shared event notified whenever any task finishes restoring (successfully or not).
+    ///
+    /// Threads waiting for another thread's in-progress restore subscribe to this event,
+    /// then re-check the specific task's `restoring`/`restored` bits after waking.
+    pub restored: Event,
 }
 
 impl Storage {
@@ -103,6 +108,7 @@ impl Storage {
                 Default::default(),
                 shard_amount,
             ),
+            restored: Event::new(|| || "Storage::restored".to_string()),
         }
     }
 
