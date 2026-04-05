@@ -439,7 +439,9 @@ impl<'e, B: BackingStorage> ExecuteContextImpl<'e, B> {
         }
 
         // --- Phase 1c: Apply I/O results for tasks we restored ---
-        for (task_id, category, storage_for_data, storage_for_meta, _, _) in &mut tasks {
+        for (task_id, category, storage_for_data, storage_for_meta, wait_data, wait_meta) in
+            &mut tasks
+        {
             if storage_for_data.is_none() && storage_for_meta.is_none() {
                 continue;
             }
@@ -464,24 +466,28 @@ impl<'e, B: BackingStorage> ExecuteContextImpl<'e, B> {
                 }
             }
 
-            if let Some(result) = storage_for_meta.take() {
-                if let Some(e) =
+            if let Some(result) = storage_for_meta.take()
+                && let Some(e) =
                     apply_restore_result(&mut task, result, SpecificTaskDataCategory::Meta)
-                {
-                    drop(task);
-                    self.backend.storage.restored.notify(usize::MAX);
-                    panic!("Failed to restore meta for task {task_id}: {e:?}");
-                }
+            {
+                drop(task);
+                self.backend.storage.restored.notify(usize::MAX);
+                panic!("Failed to restore meta for task {task_id}: {e:?}");
             }
 
             self.task_lock_counter.release();
             // Notify all waiters that restoration state changed for this task
             self.backend.storage.restored.notify(usize::MAX);
-            prepared_task_callback(self, *task_id, *category, task);
 
             if let Some(task_type) = task_type {
                 // Insert into the task cache to avoid future lookups
                 self.backend.task_cache.entry(task_type).or_insert(*task_id);
+            }
+
+            // Only call the callback if no other category is still being restored by another
+            // thread. If so, Phase 2 calls the callback after all categories are fully restored.
+            if !*wait_data && !*wait_meta {
+                prepared_task_callback(self, *task_id, *category, task);
             }
         }
 
@@ -594,23 +600,21 @@ impl<'e, B: BackingStorage> ExecuteContext<'e> for ExecuteContextImpl<'e, B> {
                     task = self.backend.storage.access_mut(task_id);
 
                     // Apply results and clear restoring bits.
-                    if let Some(result) = storage_data {
-                        if let Some(e) =
+                    if let Some(result) = storage_data
+                        && let Some(e) =
                             apply_restore_result(&mut task, result, SpecificTaskDataCategory::Data)
-                        {
-                            drop(task);
-                            self.backend.storage.restored.notify(usize::MAX);
-                            panic!("Failed to restore data for task {task_id}: {e:?}");
-                        }
+                    {
+                        drop(task);
+                        self.backend.storage.restored.notify(usize::MAX);
+                        panic!("Failed to restore data for task {task_id}: {e:?}");
                     }
-                    if let Some(result) = storage_meta {
-                        if let Some(e) =
+                    if let Some(result) = storage_meta
+                        && let Some(e) =
                             apply_restore_result(&mut task, result, SpecificTaskDataCategory::Meta)
-                        {
-                            drop(task);
-                            self.backend.storage.restored.notify(usize::MAX);
-                            panic!("Failed to restore meta for task {task_id}: {e:?}");
-                        }
+                    {
+                        drop(task);
+                        self.backend.storage.restored.notify(usize::MAX);
+                        panic!("Failed to restore meta for task {task_id}: {e:?}");
                     }
                     // Notify all waiters that restoration state changed.
                     self.backend.storage.restored.notify(usize::MAX);
@@ -739,45 +743,41 @@ impl<'e, B: BackingStorage> ExecuteContext<'e> for ExecuteContextImpl<'e, B> {
 
             // Apply results and clear restoring bits.
             // On error: drop both locks, notify waiters, then panic.
-            if let Some(result) = storage_data1 {
-                if let Some(e) =
+            if let Some(result) = storage_data1
+                && let Some(e) =
                     apply_restore_result(&mut task1, result, SpecificTaskDataCategory::Data)
-                {
-                    drop(task1);
-                    drop(task2);
-                    self.backend.storage.restored.notify(usize::MAX);
-                    panic!("Failed to restore data for task {task_id1}: {e:?}");
-                }
+            {
+                drop(task1);
+                drop(task2);
+                self.backend.storage.restored.notify(usize::MAX);
+                panic!("Failed to restore data for task {task_id1}: {e:?}");
             }
-            if let Some(result) = storage_meta1 {
-                if let Some(e) =
+            if let Some(result) = storage_meta1
+                && let Some(e) =
                     apply_restore_result(&mut task1, result, SpecificTaskDataCategory::Meta)
-                {
-                    drop(task1);
-                    drop(task2);
-                    self.backend.storage.restored.notify(usize::MAX);
-                    panic!("Failed to restore meta for task {task_id1}: {e:?}");
-                }
+            {
+                drop(task1);
+                drop(task2);
+                self.backend.storage.restored.notify(usize::MAX);
+                panic!("Failed to restore meta for task {task_id1}: {e:?}");
             }
-            if let Some(result) = storage_data2 {
-                if let Some(e) =
+            if let Some(result) = storage_data2
+                && let Some(e) =
                     apply_restore_result(&mut task2, result, SpecificTaskDataCategory::Data)
-                {
-                    drop(task1);
-                    drop(task2);
-                    self.backend.storage.restored.notify(usize::MAX);
-                    panic!("Failed to restore data for task {task_id2}: {e:?}");
-                }
+            {
+                drop(task1);
+                drop(task2);
+                self.backend.storage.restored.notify(usize::MAX);
+                panic!("Failed to restore data for task {task_id2}: {e:?}");
             }
-            if let Some(result) = storage_meta2 {
-                if let Some(e) =
+            if let Some(result) = storage_meta2
+                && let Some(e) =
                     apply_restore_result(&mut task2, result, SpecificTaskDataCategory::Meta)
-                {
-                    drop(task1);
-                    drop(task2);
-                    self.backend.storage.restored.notify(usize::MAX);
-                    panic!("Failed to restore meta for task {task_id2}: {e:?}");
-                }
+            {
+                drop(task1);
+                drop(task2);
+                self.backend.storage.restored.notify(usize::MAX);
+                panic!("Failed to restore meta for task {task_id2}: {e:?}");
             }
             // Notify all waiters that restoration state changed.
             self.backend.storage.restored.notify(usize::MAX);
