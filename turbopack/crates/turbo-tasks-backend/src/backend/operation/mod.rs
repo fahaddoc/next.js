@@ -240,7 +240,7 @@ impl<'e, B: BackingStorage> ExecuteContextImpl<'e, B> {
             if !is_restoring {
                 // The restoring bit was cleared without setting the restored bit.
                 // This means the restoring thread encountered an error.
-                bail!("restoring thread failed");
+                bail!("restoring failed");
             }
 
             // Still restoring; block until notified, then loop to re-check.
@@ -266,6 +266,28 @@ impl<'e, B: BackingStorage> ExecuteContextImpl<'e, B> {
             StorageWriteGuard<'e>,
         ),
     ) {
+        // Fast path: no backing storage to restore from — mark all tasks as restored
+        // and invoke callbacks directly, skipping the I/O pipeline.
+        if !self.should_check_backing_storage() {
+            for (task_id, category) in task_ids {
+                self.task_lock_counter.acquire();
+                let mut task = self.backend.storage.access_mut(task_id);
+                if !task.flags.is_restored(category) {
+                    task.flags.set_restored(if task_id.is_transient() {
+                        TaskDataCategory::All
+                    } else {
+                        category
+                    });
+                }
+                self.task_lock_counter.release();
+                if !task_id.is_transient() || call_prepared_task_callback_for_transient_tasks {
+                    prepared_task_callback(self, task_id, category, task);
+                }
+                // else: task guard is dropped here
+            }
+            return;
+        }
+
         let mut data_count = 0;
         let mut meta_count = 0;
         let mut all_count = 0;
@@ -297,6 +319,8 @@ impl<'e, B: BackingStorage> ExecuteContextImpl<'e, B> {
                 meta_restore_result: None,
                 wait_data: false,
                 wait_meta: false,
+                task_type: None,
+                self_restored: false,
             })
             .collect::<Vec<_>>();
         data_count += all_count;
@@ -317,9 +341,9 @@ impl<'e, B: BackingStorage> ExecuteContextImpl<'e, B> {
             let mut task = self.backend.storage.access_mut(task_id);
             let mut ready = true;
 
-            if category.includes_data() && !task.flags.is_restored(TaskDataCategory::Data) {
+            if category.includes_data() && !task.flags.data_restored() {
                 if task.flags.data_restoring() {
-                    // Another thread is restoring data; we'll wait in Phase 2
+                    // Another thread is restoring data; we'll wait in Phase 3
                     entry.wait_data = true;
                     any_waiting = true;
                     ready = false;
@@ -332,9 +356,9 @@ impl<'e, B: BackingStorage> ExecuteContextImpl<'e, B> {
                 }
             }
 
-            if category.includes_meta() && !task.flags.is_restored(TaskDataCategory::Meta) {
+            if category.includes_meta() && !task.flags.meta_restored() {
                 if task.flags.meta_restoring() {
-                    // Another thread is restoring meta; we'll wait in Phase 2
+                    // Another thread is restoring meta; we'll wait in Phase 3
                     entry.wait_meta = true;
                     any_waiting = true;
                     ready = false;
@@ -439,21 +463,21 @@ impl<'e, B: BackingStorage> ExecuteContextImpl<'e, B> {
         }
 
         // --- Phase 1c: Apply I/O results for tasks we restored ---
+        // (callbacks are deferred to Phase 2 so we finish restoring — and notify waiters —
+        // as early as possible)
+        let mut any_self_restored = false;
         for entry in &mut tasks {
             if entry.data_restore_result.is_none() && entry.meta_restore_result.is_none() {
                 continue;
             }
+            entry.self_restored = true;
+            any_self_restored = true;
             let task_id = entry.task_id;
-            let category = entry.category;
 
             self.task_lock_counter.acquire();
-            let mut task_type = None;
             let mut task = self.backend.storage.access_mut(task_id);
 
             if let Some(result) = entry.data_restore_result.take() {
-                // Capture before apply_restore_result sets is_restored, so we know whether
-                // this restore was fresh (and we should update the task cache afterwards).
-                let was_unrestored = !task.flags.is_restored(TaskDataCategory::Data);
                 if let Some(e) =
                     apply_restore_result(&mut task, result, SpecificTaskDataCategory::Data)
                 {
@@ -461,9 +485,9 @@ impl<'e, B: BackingStorage> ExecuteContextImpl<'e, B> {
                     self.backend.storage.restored.notify(usize::MAX);
                     panic!("Failed to restore data for task {task_id}: {e:?}");
                 }
-                if was_unrestored {
-                    task_type = task.get_persistent_task_type().cloned();
-                }
+                // Since we claimed this restore (data_restored() was false under the lock),
+                // the task type is always fresh here.
+                entry.task_type = task.get_persistent_task_type().cloned();
             }
 
             if let Some(result) = entry.meta_restore_result.take()
@@ -479,41 +503,92 @@ impl<'e, B: BackingStorage> ExecuteContextImpl<'e, B> {
             // immediately contend on the same DashMap shard.
             drop(task);
             self.task_lock_counter.release();
+        }
+
+        // Notify all waiting threads once, after all tasks have been restored.
+        if any_self_restored {
             self.backend.storage.restored.notify(usize::MAX);
+        }
 
-            if let Some(task_type) = task_type {
-                // Insert into the task cache to avoid future lookups
-                self.backend.task_cache.entry(task_type).or_insert(task_id);
+        // --- Phase 2: Callbacks for tasks we restored ourselves ---
+        // Separated from Phase 1c so that other threads are unblocked as early as possible.
+        for entry in &tasks {
+            if !entry.self_restored {
+                continue;
             }
-
-            // Only call the callback if no other category is still being restored by another
-            // thread. If so, Phase 2 calls the callback after all categories are fully restored.
+            if let Some(task_type) = entry.task_type.clone() {
+                // Insert into the task cache to avoid future lookups
+                self.backend
+                    .task_cache
+                    .entry(task_type)
+                    .or_insert(entry.task_id);
+            }
+            // Only call the callback if no category is still being restored by another thread.
+            // If so, Phase 3 calls the callback after all categories are fully restored.
             if !entry.wait_data && !entry.wait_meta {
-                let task = self.backend.storage.access_mut(task_id);
-                prepared_task_callback(self, task_id, category, task);
+                let task = self.backend.storage.access_mut(entry.task_id);
+                prepared_task_callback(self, entry.task_id, entry.category, task);
             }
         }
 
-        // --- Phase 2: Wait for tasks being restored by other threads ---
-        for entry in &tasks {
-            if entry.wait_data {
-                self.wait_for_restore_or_panic(entry.task_id, SpecificTaskDataCategory::Data);
+        // --- Phase 3: Wait for tasks being restored by other threads ---
+        if any_waiting {
+            // Use a single listener per iteration so all waiting tasks share one wakeup.
+            loop {
+                // Register listener BEFORE re-checking bits to avoid a lost-wakeup race.
+                let listener = self.backend.storage.restored.listen();
+                let mut still_waiting = false;
+                for entry in &tasks {
+                    if entry.wait_data {
+                        let task = self.backend.storage.access_mut(entry.task_id);
+                        let restoring = task.flags.data_restoring();
+                        let restored = task.flags.data_restored();
+                        drop(task);
+                        if !restored {
+                            if !restoring {
+                                panic!(
+                                    "Restore of Data for task {} failed in another thread",
+                                    entry.task_id
+                                );
+                            }
+                            still_waiting = true;
+                        }
+                    }
+                    if entry.wait_meta {
+                        let task = self.backend.storage.access_mut(entry.task_id);
+                        let restoring = task.flags.meta_restoring();
+                        let restored = task.flags.meta_restored();
+                        drop(task);
+                        if !restored {
+                            if !restoring {
+                                panic!(
+                                    "Restore of Meta for task {} failed in another thread",
+                                    entry.task_id
+                                );
+                            }
+                            still_waiting = true;
+                        }
+                    }
+                }
+                if !still_waiting {
+                    break;
+                }
+                listener.wait();
             }
-            if entry.wait_meta {
-                self.wait_for_restore_or_panic(entry.task_id, SpecificTaskDataCategory::Meta);
-            }
-            if entry.wait_data || entry.wait_meta {
-                // Now that the task is restored, call the callback
-                self.task_lock_counter.acquire();
-                let task = self.backend.storage.access_mut(entry.task_id);
-                self.task_lock_counter.release();
-                prepared_task_callback(self, entry.task_id, entry.category, task);
+            // All waited tasks are now restored; call their callbacks.
+            for entry in &tasks {
+                if entry.wait_data || entry.wait_meta {
+                    self.task_lock_counter.acquire();
+                    let task = self.backend.storage.access_mut(entry.task_id);
+                    self.task_lock_counter.release();
+                    prepared_task_callback(self, entry.task_id, entry.category, task);
+                }
             }
         }
     }
 }
 
-/// Per-task state threaded through the three phases of `prepare_tasks_with_callback`.
+/// Per-task state threaded through the phases of `prepare_tasks_with_callback`.
 struct TaskRestoreEntry {
     task_id: TaskId,
     category: TaskDataCategory,
@@ -521,10 +596,14 @@ struct TaskRestoreEntry {
     data_restore_result: Option<anyhow::Result<TaskStorage>>,
     /// Result of restoring the meta category (set in Phase 1b, consumed in Phase 1c).
     meta_restore_result: Option<anyhow::Result<TaskStorage>>,
-    /// Another thread claimed the data restore; we must wait in Phase 2.
+    /// Another thread claimed the data restore; we must wait in Phase 3.
     wait_data: bool,
-    /// Another thread claimed the meta restore; we must wait in Phase 2.
+    /// Another thread claimed the meta restore; we must wait in Phase 3.
     wait_meta: bool,
+    /// Task type discovered during Phase 1c data restore (used to update task cache in Phase 2).
+    task_type: Option<Arc<CachedTaskType>>,
+    /// This thread performed the restore for at least one category (set in Phase 1c).
+    self_restored: bool,
 }
 
 /// Applies a restore I/O result to a task's in-memory state.
@@ -545,10 +624,8 @@ fn apply_restore_result(
                 !task.flags.is_restored(task_category),
                 "apply_restore_result called for already-restored {task_category:?}"
             );
-            if !task.flags.is_restored(task_category) {
-                task.restore_from(storage, task_category);
-                task.flags.set_restored(task_category);
-            }
+            task.restore_from(storage, task_category);
+            task.flags.set_restored(task_category);
             task.flags.set_restoring(task_category, false);
             None
         }
