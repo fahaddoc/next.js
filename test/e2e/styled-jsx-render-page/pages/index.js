@@ -1,28 +1,8 @@
-import DynamicStyled from '../components/DynamicStyled'
-import Header from '../components/Header'
-import Footer from '../components/Footer'
-
-export default function Page({ mainColor }) {
+export default function Page() {
   return (
     <div>
-      <style jsx>{`
-        div {
-          color: ${mainColor};
-        }
-      `}</style>
-      <Header bg="navy" fg="white" />
-      <main>
-        <DynamicStyled color="blue" />
-      </main>
-      <Footer color="purple" />
+      <style jsx>{'p { color: red; }'}</style>
+      <p>hello world</p>
     </div>
   )
-}
-
-export function getServerSideProps() {
-  return {
-    props: {
-      mainColor: 'green',
-    },
-  }
 }
